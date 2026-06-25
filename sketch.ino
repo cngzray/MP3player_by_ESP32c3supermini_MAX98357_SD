@@ -8,7 +8,7 @@
 #include "AudioOutputI2S.h"
 
 // ---- WiFi 配置 ----
-static const char *WIFI_SSID     = "xxxx";
+static const char *WIFI_SSID     = "xxx";
 static const char *WIFI_PASSWORD = "xxxxxx";
 
 // ---- 音量默认值 ----
@@ -38,6 +38,11 @@ static File   g_uploadFile;
 static String g_uploadFileName;
 static String g_uploadMsg;   // 上传结果消息（供首页展示）
 static portMUX_TYPE g_uploadMux = portMUX_INITIALIZER_UNLOCKED;
+
+// handleUploadFile 内部用于进度/flush 阈值的基准计数器，
+// 放到全局而不是函数内 static，避免跨上传状态污染
+static size_t s_uploadLastFlush    = 0;
+static size_t s_uploadLastReported = 0;
 
 // 原子地读取/更新上传进度（避免多任务竞态）
 static void uploadProgressSet(size_t uploaded, size_t total, bool ok) {
@@ -214,6 +219,19 @@ static String buildHomePage(const String &message, float curGainPercent) {
           "      <button id=\"btnPause\"  class=\"btn btn-green\">暂停 / 恢复</button>\n"
           "      <button id=\"btnStop\"   class=\"btn btn-red\">停止</button>\n"
           "    </div>\n"
+          // 播放进度条区域：文件名 + 进度条 + 百分比
+          "    <div id=\"progressWrap\" style=\"margin-top:1.2rem;display:none;\">\n"
+          "      <div style=\"font-size:.9rem;color:#555;margin-bottom:.4rem;\">\n"
+          "        <span id=\"progressFile\"></span>\n"
+          "        <span id=\"progressStatus\" style=\"float:right;color:#888;\"></span>\n"
+          "      </div>\n"
+          "      <div style=\"height:12px;background:#eee;border-radius:8px;overflow:hidden;\">\n"
+          "        <div id=\"progressBar\" style=\"height:100%;width:0%;background:linear-gradient(90deg,#2d7ef7,#4a9dff);transition:width .3s;\"></div>\n"
+          "      </div>\n"
+          "      <div style=\"font-size:.85rem;color:#888;margin-top:.4rem;text-align:right;\">\n"
+          "        <span id=\"progressText\">0 KB / 0 KB (0%)</span>\n"
+          "      </div>\n"
+          "    </div>\n"
           "    <div id=\"status\" class=\"msg\" style=\"display:none;\"></div>\n"
           "  </div>\n";
 
@@ -250,7 +268,12 @@ static String buildHomePage(const String &message, float curGainPercent) {
            "    var $upText   = $('#upText');\n"
            "    var $file     = $('#file');\n"
            "    var currentPlaying = '';\n"
-
+           "    var $progWrap   = $('#progressWrap');\n"
+           "    var $progBar    = $('#progressBar');\n"
+           "    var $progFile   = $('#progressFile');\n"
+           "    var $progText   = $('#progressText');\n"
+           "    var $progStatus = $('#progressStatus');\n"
+           "\n"
            "    function showStatus(msg, ok){\n"
            "      $status.removeClass('msg-ok msg-err').text(msg).show();\n"
            "      $status.addClass(ok===false ? 'msg-err' : (ok===true ? 'msg-ok' : ''));\n"
@@ -260,6 +283,28 @@ static String buildHomePage(const String &message, float curGainPercent) {
            "      if(n<1024*1024) return (n/1024).toFixed(1)+' KB';\n"
            "      return (n/1024/1024).toFixed(2)+' MB';\n"
            "    }\n"
+           "    function refreshProgress(){\n"
+           "      $.getJSON('/api/status').done(function(r){\n"
+           "        if(r.playing){\n"
+           "          $progWrap.show();\n"
+           "          $progFile.text(r.fileName || '未知');\n"
+           "          $progBar.css('width', r.percent.toFixed(1) + '%');\n"
+           "          // 优先显示时间（mm:ss / mm:ss），若时长为 0 则显示 fallback 文本\n"
+           "          var timeStr;\n"
+           "          if(r.totalSec > 0){\n"
+           "            timeStr = r.curTime + ' / ' + r.totalTime + ' (' + r.percent.toFixed(1) + '%)';\n"
+           "          } else {\n"
+           "            timeStr = '播放中 (' + r.percent.toFixed(1) + '%)';\n"
+           "          }\n"
+           "          $progText.text(timeStr);\n"
+           "          $progStatus.text(r.paused ? '已暂停' : '播放中');\n"
+           "        } else {\n"
+           "          $progWrap.hide();\n"
+           "          $progBar.css('width', '0%');\n"
+           "        }\n"
+           "      });\n"
+           "    }\n"
+           "    setInterval(refreshProgress, 500);\n"
            "    function refreshFiles(){\n"
            "      $.get('/api/files').done(function(html){\n"
            "        $fileList.html(html);\n"
@@ -391,11 +436,18 @@ static String buildHomePage(const String &message, float curGainPercent) {
 // 这样彻底避免了竞态条件，且所有耗时操作都在正常调度环境中执行。
 // ═════════════════════════════════════════════════════════════
 
-static volatile bool  g_cmdStop     = false;  // 请求停止
-static volatile bool  g_cmdPause    = false;  // 请求切换暂停
-static volatile bool  g_playBusy    = false;  // loop 正在操作音频资源
-static String g_cmdPlayPath;                  // 待播放文件路径（空表示无请求）
-static bool   g_paused = false;               // 暂停标志（只在 loop 中读写）
+static volatile bool     g_cmdStop     = false;  // 请求停止
+static volatile bool     g_cmdPause    = false;  // 请求切换暂停
+static volatile bool     g_playBusy    = false;  // loop 正在操作音频资源
+static String g_cmdPlayPath;                     // 待播放文件路径（空表示无请求）
+static bool   g_paused = false;                  // 暂停标志（只在 loop 中读写）
+
+// ── 播放进度信息（loop 中写，Web 只读）────────────
+static volatile uint32_t g_posBytes   = 0;      // 已播放字节数
+static volatile uint32_t g_totalBytes = 0;      // 文件总字节数
+static volatile bool     g_isPlaying  = false;   // 当前是否播放中
+static String g_playingName;                       // 当前播放的文件名（loop 写，Web 只读）
+static volatile uint32_t g_totalSec   = 0;      // 文件总时长（秒，播放启动时计算）
 
 // 停止当前播放并释放资源 —— ⚠️ 只允许在 loop() 主任务中调用！
 static void stopPlaybackInLoop() {
@@ -420,6 +472,173 @@ static void stopPlaybackInLoop() {
   }
 
   g_paused = false;
+  // 清除进度信息
+  g_posBytes   = 0;
+  g_totalBytes = 0;
+  g_isPlaying  = false;
+  g_playingName = "";
+  g_totalSec   = 0;
+}
+
+// ── MP3 帧头解析：计算文件总时长（秒）────────────
+// MP3 帧头 4 字节格式（MSB 优先）：
+//   Byte 0 = 1111 1111                          (同步字)
+//   Byte 1 = 111VVLLP                           (VV=版本, LL=Layer, P=保护)
+//     VV: 11=MPEG1, 10=MPEG2, 01=reserved, 00=MPEG2.5
+//     LL: 11=LayerI, 10=LayerII, 01=LayerIII, 00=reserved
+//   Byte 2 = EEEEFFGH
+//     EEEE: 比特率索引 (表查)
+//     FF:   采样率索引 (表查)
+//     G:    padding
+//     H:    private
+//   Byte 3 = IIJJKLMM  (本函数不使用)
+//
+// 算法：
+//   1. 跳过 ID3V2 标签
+//   2. 扫描前 64KB，查找多个有效 MP3 帧头
+//   3. 对每个候选帧头：计算理论帧长度，验证下一帧是否也以 0xFF 开头（帧对齐校验）
+//   4. 取前 5 个有效帧的平均比特率，按 CBR 公式估算总时长
+//
+// 返回：总时长（秒）；失败返回 0
+// ⚠️ 只在 loop() 主任务中调用（SD 操作）
+static uint32_t calcMp3DurationSec(const String &path, uint32_t fileSizeBytes) {
+  if (fileSizeBytes == 0) return 0;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) return 0;
+
+  // ── 1. 跳过 ID3V2 标签
+  uint8_t header[10];
+  uint32_t skipBytes = 0;
+  if (f.available() >= 10) {
+    f.read(header, 10);
+    if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
+      skipBytes = 10 +
+                  ((uint32_t)(header[6] & 0x7F) << 21) +
+                  ((uint32_t)(header[7] & 0x7F) << 14) +
+                  ((uint32_t)(header[8] & 0x7F) << 7) +
+                  ((uint32_t)(header[9] & 0x7F));
+      Serial.printf("[MP3] ID3V2 tag found, skip %lu bytes\n", (unsigned long)skipBytes);
+      f.seek(skipBytes);
+    } else {
+      f.seek(0);
+    }
+  }
+
+  // ── 2. 扫描多个有效帧，收集比特率
+  const int MAX_SCAN = 64 * 1024;
+  const int VALID_FRAMES_NEEDED = 5;
+  uint32_t sumBitrate = 0;
+  int validCount = 0;
+  uint32_t firstFramePos = 0;
+  int scanned = 0;
+
+  // 比特率表（kbps）
+  static const uint16_t brTableV1_L3[16] = {
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+  };
+  static const uint16_t brTableV2_L3[16] = {
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 0
+  };
+  // 采样率表（Hz）
+  static const uint16_t srTableV1[4] = {44100, 48000, 32000, 0};
+  static const uint16_t srTableV2[4] = {22050, 24000, 16000, 0};
+  static const uint16_t srTableV25[4] = {11025, 12000, 8000, 0};
+
+  // 扫描循环：每次找到 0xFF 后尝试解析帧头
+  while (f.available() >= 5 && scanned < MAX_SCAN && validCount < VALID_FRAMES_NEEDED) {
+    uint32_t pos0 = f.position();
+    uint8_t b0 = f.read(); scanned++;
+    if (b0 != 0xFF) continue;
+
+    uint8_t b1 = f.read(); scanned++;
+    if ((b1 & 0xE0) != 0xE0) continue;  // 同步字：高 3 位必须是 111
+
+    uint8_t b2 = f.read(); scanned++;
+    uint8_t b3 = f.read(); scanned++;
+
+    // 解析版本与 Layer
+    uint8_t version = (b1 >> 3) & 0x03;  // VV
+    if (version == 1) continue;          // reserved
+    uint8_t layer = (b1 >> 1) & 0x03;    // LL
+    if (layer != 1) continue;            // ✅ 只处理 Layer III (MP3)：LL=01=1
+
+    // 比特率索引
+    uint8_t brIdx = (b2 >> 4) & 0x0F;
+    if (brIdx == 0 || brIdx == 15) continue;
+
+    // 采样率索引
+    uint8_t srIdx = (b2 >> 2) & 0x03;
+    if (srIdx == 3) continue;
+
+    // padding
+    uint8_t padding = (b2 >> 1) & 0x01;
+
+    // 查表
+    uint16_t kbps = 0;
+    uint16_t srHz = 0;
+    const uint16_t *srTable;
+
+    if (version == 3) {              // MPEG1
+      kbps = brTableV1_L3[brIdx];
+      srTable = srTableV1;
+    } else if (version == 2) {       // MPEG2
+      kbps = brTableV2_L3[brIdx];
+      srTable = srTableV2;
+    } else {                         // MPEG2.5
+      kbps = brTableV2_L3[brIdx];
+      srTable = srTableV25;
+    }
+    srHz = srTable[srIdx];
+    if (kbps == 0 || srHz == 0) continue;
+
+    // ── 关键校验：计算理论帧长度，验证下一帧同步字
+    // 帧长度公式（字节）：
+    //   MPEG1 : 144 × kbps / srHz + padding
+    //   MPEG2/2.5 : 72 × kbps / srHz + padding
+    uint32_t frameLen;
+    if (version == 3) {
+      frameLen = (144 * (uint32_t)kbps * 1000) / (uint32_t)srHz + padding;
+    } else {
+      frameLen = (72 * (uint32_t)kbps * 1000) / (uint32_t)srHz + padding;
+    }
+    if (frameLen < 8 || frameLen > 2048) continue;  // 合理性检查
+
+    // 跳到下一帧位置，检查是否也是 0xFF（帧对齐校验，排除假帧头）
+    if (f.available() >= (int)(frameLen - 4 + 1)) {
+      f.seek(pos0 + frameLen);
+      uint8_t nextSync = f.read(); scanned++;
+      if (nextSync == 0xFF) {
+        // 验证通过，这是真实帧
+        sumBitrate += (uint32_t)kbps * 1000;
+        validCount++;
+        if (firstFramePos == 0) firstFramePos = pos0;
+        if (validCount == 1) {
+          Serial.printf("[MP3] frame validated: bitrate=%u kbps, sampleRate=%u Hz, frameLen=%lu\n",
+                        kbps, srHz, (unsigned long)frameLen);
+        }
+      }
+      // 继续从当前位置扫描下一个候选
+    } else {
+      // 文件末尾，无法验证下一帧，也不接受（避免错误）
+      break;
+    }
+  }
+
+  f.close();
+
+  if (validCount == 0) {
+    Serial.println(F("[MP3] no valid MP3 frames found (not an MP3?)"));
+    return 0;
+  }
+
+  // 用平均比特率估算总时长
+  uint32_t avgBitrate = sumBitrate / (uint32_t)validCount;
+  uint32_t durationSec = (uint32_t)((uint64_t)fileSizeBytes * 8ULL / (uint64_t)avgBitrate);
+  Serial.printf("[MP3] duration: %lu sec (file %lu KB, avgBitrate %lu kbps, %d frames validated)\n",
+                (unsigned long)durationSec, (unsigned long)(fileSizeBytes / 1024),
+                (unsigned long)(avgBitrate / 1000), validCount);
+  return durationSec;
 }
 
 // Web 任务请求停止：设置标志位，并等待 loop 实际完成清理（超时兜底）
@@ -576,28 +795,36 @@ static void handleRoot(AsyncWebServerRequest *request) {
 // ---- AsyncWebServer 上传回调（multipart/form-data）----
 // 注意：AsyncWebServer 会在独立任务中调用这些回调，不要和主循环共享非线程
 // 安全资源（直接操作 SD 的 File 是线程安全的；其它共享状态使用临界区）
+// ⚠️ 关键：handleUploadRequest 是请求行 + headers 到达时调用（body 还没开始）
+// 一定不要在这里调用 request->send()，否则部分版本的 ESPAsyncWebServer 会
+// 把尚未处理的 body 丢弃，导致上传被截断。响应必须在 onFile 的 final=true 时发送。
 static void handleUploadRequest(AsyncWebServerRequest *request) {
-  // 上传结束后（body 处理完毕）被调用：返回简单 JSON/文本
-  // 由于实际文件写入在 onFile 回调中完成，这里只返回上传结果文本
-  char buf[256];
-  size_t uploaded, total; bool ok, up;
-  uploadProgressGet(uploaded, total, ok, up);
-  if (ok) {
-    snprintf(buf, sizeof(buf), "OK %u bytes", (unsigned)uploaded);
-    request->send(200, "text/plain", buf);
-  } else {
-    snprintf(buf, sizeof(buf), "FAIL (uploaded %u bytes)", (unsigned)uploaded);
-    request->send(500, "text/plain", buf);
-  }
+  // 故意留空：响应将在 handleUploadFile 的 final=true 阶段发送
 }
 
-// 文件上传 onFile：对 multipart 的每个文件字段被调用
-// data==NULL 表示该字段结束；len==当前 chunk 大小；index 用于区分同一字段多次调用
+// onFile 回调的真实语义（必须严格遵循，否则文件会被提前关闭或永不关闭）：
+//   - 对 multipart/form-data 中的"每一个字段"都会回调，包括非文件字段；
+//   - filename 为空 == 普通 form 字段（如 hidden / submit 按钮）；
+//   - data==nullptr && len==0 表示"当前字段"的所有 chunk 已送完；
+//   - final==true 表示"整次请求"的 body 全部收完（与当前是哪个字段无关！）；
+//   - index 语义在不同版本 ESPAsyncWebServer 中不一致，不要依赖它。
+//
+// 关键设计：
+//   1. 初始化（打开文件）：用 !g_uploading + filename 非空 作为判断 → 只初始化一次
+//   2. 写数据：只要 g_uploadFile 打开 + 有数据就写，即使当前回调带 final=true
+//   3. final=true 收尾：放在函数最后，对所有回调都生效 → 保证无论哪个字段是
+//      form 最后一个字段，文件都能被 flush + close。同时在这里发送 HTTP 响应。
+//   4. handleUploadRequest 中绝不调用 send()，否则部分 ESPAsyncWebServer 版本
+//      会在 body 接收前发送响应，导致上传被截断。
 static void handleUploadFile(AsyncWebServerRequest *request,
                              const String &filename,
                              size_t index, uint8_t *data, size_t len, bool final) {
-  // 第一次（index==0）：打开目标文件
-  if (!index) {
+  // ── Step 1: 首次文件字段回调：打开目标文件 ──────────────────
+  // 用 !g_uploading + 有效文件名 作为初始化判断：
+  //  - filename 非空：只对文件字段做初始化，忽略普通 form 字段
+  //  - !g_uploading：保证整个上传生命周期只初始化一次，避免文件被反复删除重建
+  // （index 在不同版本 ESPAsyncWebServer 中语义不稳定，不能依赖它）
+  if (!g_uploading && filename.length() > 0) {
     // 禁止路径穿越：只取文件名
     String name = filename;
     int s1 = name.lastIndexOf('/');
@@ -665,12 +892,19 @@ static void handleUploadFile(AsyncWebServerRequest *request,
     g_uploadOK    = true;
     portEXIT_CRITICAL(&g_uploadMux);
 
+    // 每约 1MB 执行一次 flush；每 ~256KB 打印一次进度。
+    // 用函数内静态变量 + g_uploaded 的基准差值，避免跨上传状态污染
+    s_uploadLastFlush    = 0;
+    s_uploadLastReported = 0;
+
     Serial.printf("[Upload] Start: %s (Content-Length=%u, free ~%u MB)\n",
                   g_uploadFileName.c_str(), (unsigned)total,
                   (unsigned)(SD.totalBytes() - SD.usedBytes()) / (1024 * 1024));
   }
 
-  // 写入 chunk 到 SD（len 可能为 0，也要判断 file 是否打开成功）
+  // ── Step 2: 写入 chunk 到 SD ──────────────────────────────────
+  // 只要 g_uploadFile 打开 + 有数据就写入。
+  // 注意：即使 final=true 也可能同时带数据，必须先写入再关闭！
   if (g_uploadFile && data != nullptr && len > 0) {
     // 分块写入（每块最多 4KB）+ 每写一块后 yield，防止 AsyncTCP 任务看门狗超时
     size_t totalWritten = 0;
@@ -704,54 +938,94 @@ static void handleUploadFile(AsyncWebServerRequest *request,
     if (totalWritten != len) g_uploadOK = false;
     portEXIT_CRITICAL(&g_uploadMux);
 
-    // 每约 1MB 执行一次 flush，把缓存真正写到卡上
-    static size_t lastFlush = 0;
-    if (g_uploaded - lastFlush > 1024 * 1024) {
-      lastFlush = g_uploaded;
+    // 每约 1MB 执行一次 flush，把 FatFS 缓存真正刷到 SD 卡
+    if (g_uploaded - s_uploadLastFlush > 1024 * 1024) {
+      s_uploadLastFlush = g_uploaded;
       g_uploadFile.flush();
     }
 
     // 定期打印进度（每 ~256KB 输出一次，避免串口刷屏）
-    static size_t lastReported = 0;
-    if (g_uploaded - lastReported > 256 * 1024 || final) {
-      lastReported = g_uploaded;
+    if (g_uploaded - s_uploadLastReported > 256 * 1024) {
+      s_uploadLastReported = g_uploaded;
       Serial.printf("[Upload] %u / %u bytes (free ~%u MB)\n",
                     (unsigned)g_uploaded, (unsigned)g_uploadTotal,
                     (unsigned)(SD.totalBytes() - SD.usedBytes()) / (1024 * 1024));
     }
   }
 
-  // 最后一块：关闭文件
+  // ── Step 3: final=true：请求结束，关闭文件、发送 HTTP 响应 ──
+  // ⚠️ 必须放在 Step 2 之后！否则最后一个带数据的 chunk（data+final=true）
+  //    会因为我们先 return 而丢失数据。
+  // 同时放在函数底部也意味着：无论当前回调的 filename 是不是空、
+  // 文件字段是不是 form 的最后一个字段，这里都能正确关闭文件。
   if (final) {
     bool ok = true;
+    size_t finalUploaded = 0;
+    size_t upSize = 0;
+    bool actuallyUploading = g_uploading; // 记录快照
+
+    // 先 flush + 关闭文件句柄
     if (g_uploadFile) {
+      g_uploadFile.flush();
       g_uploadFile.close();
-      g_uploadFile = File();   // 清空，避免残留状态影响下次上传
+      g_uploadFile = File();
     }
-    // size() 必须在 close() 之后读取，否则 SD 库可能返回未更新的 FAT 缓存值
-    size_t upSize = SD.exists(g_uploadFileName)
-                    ? SD.open(g_uploadFileName, FILE_READ).size()
-                    : 0;
+
+    // 更新状态
     portENTER_CRITICAL(&g_uploadMux);
     ok = g_uploadOK;
+    finalUploaded = g_uploaded;
     g_uploading = false;
     portEXIT_CRITICAL(&g_uploadMux);
 
+    // 只有真正启动过上传才去读文件大小，避免 g_uploadFileName 残留旧值
+    if (actuallyUploading && g_uploadFileName.length() > 0 &&
+        SD.exists(g_uploadFileName)) {
+      File f = SD.open(g_uploadFileName, FILE_READ);
+      if (f) {
+        upSize = f.size();
+        f.close();
+      }
+    }
+
     char msg[256];
-    if (ok) {
+    if (ok && upSize > 0) {
+      // 额外校验：SD 文件大小应与记录的写入字节数一致
+      if ((int32_t)upSize != (int32_t)finalUploaded) {
+        Serial.printf("[Upload] WARNING: size mismatch - file=%u, written=%u\n",
+                      (unsigned)upSize, (unsigned)finalUploaded);
+      }
       snprintf(msg, sizeof(msg), "上传成功：%s (%u 字节)",
                g_uploadFileName.c_str(), (unsigned)upSize);
       Serial.printf("[Upload] Finished: %s (%u bytes)\n",
                     g_uploadFileName.c_str(), (unsigned)upSize);
     } else {
-      snprintf(msg, sizeof(msg), "上传失败：已写入 %u 字节", (unsigned)upSize);
-      Serial.printf("[Upload] Write failed after %u bytes\n", (unsigned)upSize);
-      // 失败时删除不完整文件，避免下次上传受影响
+      if (upSize == 0) {
+        snprintf(msg, sizeof(msg), "上传失败：文件为空");
+        Serial.printf("[Upload] Write failed: empty file (reported %u bytes)\n",
+                      (unsigned)finalUploaded);
+      } else {
+        snprintf(msg, sizeof(msg), "上传失败：已写入 %u 字节", (unsigned)upSize);
+        Serial.printf("[Upload] Write failed after %u bytes\n", (unsigned)upSize);
+      }
+      // 失败时删除不完整文件
       if (g_uploadFileName.length() > 0 && SD.exists(g_uploadFileName)) {
         SD.remove(g_uploadFileName);
       }
     }
     g_uploadMsg = msg;
+
+    // ⚠️ 在 onFile 回调中发送 HTTP 响应（body 已收完）
+    //    一定不要在 handleUploadRequest 里提前发送，否则会截断上传
+    if (ok && upSize > 0) {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "OK %u bytes", (unsigned)upSize);
+      request->send(200, "text/plain", buf);
+    } else {
+      char buf[64];
+      snprintf(buf, sizeof(buf), "FAIL (uploaded %u bytes)", (unsigned)upSize);
+      request->send(500, "text/plain", buf);
+    }
   }
 }
 
@@ -794,6 +1068,63 @@ static void handleSetVolume(AsyncWebServerRequest *request) {
            percent, g_volumeGain);
   Serial.printf("[Web] Volume set to: %.1f%% (gain=%.3f)\n",
                 percent, g_volumeGain);
+  request->send(200, "application/json", buf);
+}
+
+// /api/status：返回当前播放状态与进度（供前端轮询）
+// JSON 字段：
+//   playing:   是否播放中
+//   paused:    是否暂停
+//   fileName:  当前播放的文件名（可能为空）
+//   percent:   播放进度百分比（0.0 ~ 100.0）
+//   curTime:   当前播放时间（mm:ss 格式的字符串，如 "1:23"）
+//   totalTime: 总时长（mm:ss 格式的字符串，如 "3:45"）
+//   curSec:    当前播放秒数
+//   totalSec:  总秒数
+static void handleStatus(AsyncWebServerRequest *request) {
+  // 读取原子变量（读取简单整型是单操作，安全）
+  uint32_t posB     = g_posBytes;
+  uint32_t totalB   = g_totalBytes;
+  uint32_t totalSec = g_totalSec;
+  bool     isPlay   = g_isPlaying;
+  bool     isPaused = g_paused;
+  String   name     = g_playingName;  // String 用局部复制
+
+  // 百分比进度
+  float percent = 0.0f;
+  if (totalB > 0 && posB <= totalB) {
+    percent = (float)posB * 100.0f / (float)totalB;
+    if (percent > 100.0f) percent = 100.0f;
+  }
+
+  // 当前播放秒数（按字节比例估算）
+  uint32_t curSec = 0;
+  if (totalB > 0) {
+    curSec = (uint32_t)((uint64_t)totalSec * (uint64_t)posB / (uint64_t)totalB);
+  }
+
+  // 格式化为 mm:ss
+  char curTimeStr[16];
+  char totalTimeStr[16];
+  snprintf(curTimeStr, sizeof(curTimeStr), "%02lu:%02lu",
+           (unsigned long)(curSec / 60), (unsigned long)(curSec % 60));
+  snprintf(totalTimeStr, sizeof(totalTimeStr), "%02lu:%02lu",
+           (unsigned long)(totalSec / 60), (unsigned long)(totalSec % 60));
+
+  char buf[512];
+  snprintf(buf, sizeof(buf),
+    "{\"playing\":%s,\"paused\":%s,\"fileName\":\"%s\","
+    "\"percent\":%.2f,\"curSec\":%lu,\"totalSec\":%lu,"
+    "\"curTime\":\"%s\",\"totalTime\":\"%s\"}",
+    isPlay   ? "true" : "false",
+    isPaused ? "true" : "false",
+    htmlEscape(name).c_str(),
+    percent,
+    (unsigned long)curSec,
+    (unsigned long)totalSec,
+    curTimeStr,
+    totalTimeStr);
+
   request->send(200, "application/json", buf);
 }
 
@@ -846,6 +1177,8 @@ static void connectWiFi() {
   g_webServer.on("/upload/progress", HTTP_GET, handleUploadProgress);
   // 文件列表 HTML 片段（供 jQuery 局部刷新）
   g_webServer.on("/api/files", HTTP_GET, handleApiFiles);
+  // 播放状态查询（GET /api/status，返回 JSON，供进度条轮询）
+  g_webServer.on("/api/status", HTTP_GET, handleStatus);
 
   // 文件上传：POST /upload（multipart/form-data，支持 10MB 级大文件）
   g_webServer.on("/upload", HTTP_POST,
@@ -1012,6 +1345,18 @@ void loop() {
 
     Serial.printf("[loop] Starting playback: %s\n", path.c_str());
 
+    // 先通过 SD 获取文件总大小 + 解析 MP3 帧头获取时长
+    uint32_t fileSize = 0;
+    uint32_t durationSec = 0;
+    {
+      File f = SD.open(path, FILE_READ);
+      if (f) {
+        fileSize = f.size();
+        f.close();
+      }
+    }
+    durationSec = calcMp3DurationSec(path, fileSize);
+
     mp3 = new AudioGeneratorMP3();
     file = new AudioFileSourceSD(path.c_str());
     if (!mp3 || !file) {
@@ -1031,7 +1376,15 @@ void loop() {
       return;
     }
 
-    Serial.printf("[loop] Now playing: %s\n", path.c_str());
+    // 记录播放进度相关信息
+    g_totalBytes = fileSize;
+    g_totalSec   = durationSec;
+    g_posBytes   = 0;
+    g_isPlaying  = true;
+    g_playingName = path;
+
+    Serial.printf("[loop] Now playing: %s (%lu bytes, %lu sec)\n",
+                  path.c_str(), (unsigned long)fileSize, (unsigned long)durationSec);
     g_playBusy = false;
     // 继续到下一阶段处理播放
   }
@@ -1060,6 +1413,10 @@ void loop() {
         Serial.println("\n>>> Playback finished.");
         stopPlaybackInLoop();
       }
+    }
+    // 播放后更新位置（AudioFileSourceSD 提供 getPos() 返回当前字节偏移）
+    if (file != nullptr) {
+      g_posBytes = file->getPos();
     }
     g_playBusy = false;
     yield();
